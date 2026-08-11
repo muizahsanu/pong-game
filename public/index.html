@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pong Multiplayer</title>
+  <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.24/dist/full.min.css" rel="stylesheet" type="text/css">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top left, rgba(45, 212, 191, 0.16), transparent 32rem),
+        radial-gradient(circle at bottom right, rgba(248, 113, 113, 0.14), transparent 30rem),
+        #101317;
+    }
+
+    .game-shell {
+      width: min(96vw, 1040px);
+    }
+
+    canvas {
+      width: 100%;
+      aspect-ratio: 900 / 520;
+      background: #0b0f14;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 8px;
+      box-shadow: 0 20px 70px rgba(0, 0, 0, 0.34);
+      display: block;
+    }
+
+    .room-list {
+      max-height: 260px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+<body class="text-slate-100">
+  <main class="min-h-screen px-4 py-6 flex items-center justify-center">
+    <section class="game-shell space-y-4">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p class="text-sm uppercase tracking-widest text-teal-200/80">Realtime Multiplayer</p>
+          <h1 class="text-4xl font-bold leading-tight">Pong Arena</h1>
+        </div>
+        <div class="stats bg-base-300/70 border border-white/10">
+          <div class="stat px-5 py-3">
+            <div class="stat-title">Room</div>
+            <div id="roomLabel" class="stat-value text-lg">Lobby</div>
+          </div>
+          <div class="stat px-5 py-3">
+            <div class="stat-title">Kamu</div>
+            <div id="sideLabel" class="stat-value text-lg">-</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="lobbyView" class="grid gap-4 lg:grid-cols-[360px_1fr]">
+        <div class="bg-base-300/70 border border-white/10 rounded-lg p-4 space-y-4">
+          <button id="startBtn" class="btn btn-primary w-full">Mulai Permainan</button>
+          <div class="divider my-1">atau</div>
+          <div class="join w-full">
+            <input id="roomNameInput" class="input input-bordered join-item w-full" maxlength="24" placeholder="Nama room">
+            <button id="createNamedBtn" class="btn join-item">Buat</button>
+          </div>
+          <p id="statusText" class="text-sm text-slate-300">Buat room, lalu kirim link halaman ini ke player kedua.</p>
+        </div>
+
+        <div class="bg-base-300/70 border border-white/10 rounded-lg p-4">
+          <div class="flex items-center justify-between gap-3 mb-3">
+            <h2 class="text-xl font-semibold">Room Tersedia</h2>
+            <button id="refreshBtn" class="btn btn-sm btn-ghost">Refresh</button>
+          </div>
+          <div id="rooms" class="room-list space-y-2"></div>
+        </div>
+      </div>
+
+      <div id="gameView" class="hidden space-y-3">
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div id="gameStatus" class="text-slate-300">Menunggu player kedua...</div>
+            <div id="readySummary" class="text-sm text-slate-500">0/2 player siap</div>
+          </div>
+          <div class="flex gap-2">
+            <button id="readyBtn" class="btn btn-sm btn-primary" disabled>Saya Siap</button>
+            <button id="leaveBtn" class="btn btn-sm btn-outline">Keluar Room</button>
+          </div>
+        </div>
+        <canvas id="game" width="900" height="520"></canvas>
+        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <button id="upBtn" class="btn btn-secondary">Naik</button>
+          <button id="downBtn" class="btn btn-secondary">Turun</button>
+          <div class="bg-base-300/70 border border-white/10 rounded-lg px-4 py-3">
+            <div class="text-xs uppercase text-slate-400">Player 1</div>
+            <div id="leftScore" class="text-2xl font-bold">0</div>
+          </div>
+          <div class="bg-base-300/70 border border-white/10 rounded-lg px-4 py-3">
+            <div class="text-xs uppercase text-slate-400">Player 2</div>
+            <div id="rightScore" class="text-2xl font-bold">0</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    const lobbyView = document.getElementById("lobbyView");
+    const gameView = document.getElementById("gameView");
+    const roomsEl = document.getElementById("rooms");
+    const statusText = document.getElementById("statusText");
+    const gameStatus = document.getElementById("gameStatus");
+    const roomLabel = document.getElementById("roomLabel");
+    const sideLabel = document.getElementById("sideLabel");
+    const leftScore = document.getElementById("leftScore");
+    const rightScore = document.getElementById("rightScore");
+    const readyBtn = document.getElementById("readyBtn");
+    const readySummary = document.getElementById("readySummary");
+
+    let side = null;
+    let room = null;
+    let gameState = null;
+    let displayState = null;
+    const keys = new Set();
+
+    document.getElementById("startBtn").addEventListener("click", () => {
+      socket.emit("createRoom", "");
+    });
+
+    document.getElementById("createNamedBtn").addEventListener("click", () => {
+      socket.emit("createRoom", document.getElementById("roomNameInput").value);
+    });
+
+    document.getElementById("refreshBtn").addEventListener("click", () => {
+      socket.emit("getRooms");
+    });
+
+    readyBtn.addEventListener("click", () => {
+      socket.emit("ready");
+    });
+
+    document.getElementById("leaveBtn").addEventListener("click", () => {
+      socket.emit("leaveRoom");
+      room = null;
+      side = null;
+      gameState = null;
+      displayState = null;
+      lobbyView.classList.remove("hidden");
+      gameView.classList.add("hidden");
+      roomLabel.textContent = "Lobby";
+      sideLabel.textContent = "-";
+      drawEmpty();
+    });
+
+    socket.on("rooms", renderRooms);
+
+    socket.on("joined", (payload) => {
+      side = payload.side;
+      roomLabel.textContent = payload.roomId;
+      sideLabel.textContent = side === "left" ? "Player 1" : "Player 2";
+      lobbyView.classList.add("hidden");
+      gameView.classList.remove("hidden");
+    });
+
+    socket.on("roomState", (payload) => {
+      room = payload;
+      gameState = payload.state;
+      if (!displayState || payload.status !== "playing") {
+        displayState = cloneState(gameState);
+      }
+      leftScore.textContent = gameState.score.left;
+      rightScore.textContent = gameState.score.right;
+      updateReadyButton(payload);
+
+      if (payload.status === "waiting") {
+        gameStatus.textContent = "Menunggu player kedua...";
+      } else if (payload.status === "ready") {
+        gameStatus.textContent = "Dua player sudah masuk. Tekan siap untuk mulai.";
+      } else if (payload.status === "pointPause") {
+        gameStatus.textContent = `Poin masuk. Skor ${gameState.score.left} - ${gameState.score.right}. Tekan lanjut jika siap.`;
+      } else if (payload.status === "playing") {
+        gameStatus.textContent = side === "left"
+          ? "Game mulai. Kamu mengontrol paddle kiri."
+          : "Game mulai. Kamu mengontrol paddle kanan.";
+      } else {
+        gameStatus.textContent = `${payload.winner} menang. Skor akhir ${gameState.score.left} - ${gameState.score.right}.`;
+      }
+    });
+
+    socket.on("errorMessage", (message) => {
+      statusText.textContent = message;
+    });
+
+    window.addEventListener("keydown", (event) => {
+      if (["ArrowUp", "ArrowDown", "w", "s", "W", "S"].includes(event.key)) {
+        event.preventDefault();
+        keys.add(event.key.toLowerCase());
+        sendInput();
+      }
+    });
+
+    window.addEventListener("keyup", (event) => {
+      keys.delete(event.key.toLowerCase());
+      sendInput();
+    });
+
+    function bindHoldButton(id, direction) {
+      const button = document.getElementById(id);
+      const start = (event) => {
+        event.preventDefault();
+        socket.emit("input", direction);
+      };
+      const stop = () => socket.emit("input", 0);
+
+      button.addEventListener("pointerdown", start);
+      button.addEventListener("pointerup", stop);
+      button.addEventListener("pointerleave", stop);
+      button.addEventListener("pointercancel", stop);
+    }
+
+    bindHoldButton("upBtn", -1);
+    bindHoldButton("downBtn", 1);
+
+    function sendInput() {
+      let direction = 0;
+      if (keys.has("arrowup") || keys.has("w")) direction -= 1;
+      if (keys.has("arrowdown") || keys.has("s")) direction += 1;
+      socket.emit("input", direction);
+    }
+
+    function updateReadyButton(payload) {
+      const currentPlayer = payload.players.find((player) => player.side === side);
+      const isReady = Boolean(currentPlayer && currentPlayer.ready);
+      readySummary.textContent = `${payload.readyCount}/2 player siap`;
+
+      if (payload.status === "ready") {
+        readyBtn.textContent = isReady ? "Menunggu Lawan" : "Saya Siap";
+        readyBtn.disabled = isReady || payload.playerCount < 2;
+        readyBtn.classList.remove("hidden");
+        return;
+      }
+
+      if (payload.status === "pointPause") {
+        readyBtn.textContent = isReady ? "Menunggu Lawan" : "Lanjut Rally";
+        readyBtn.disabled = isReady || payload.playerCount < 2;
+        readyBtn.classList.remove("hidden");
+        return;
+      }
+
+      if (payload.status === "waiting") {
+        readyBtn.textContent = "Saya Siap";
+        readyBtn.disabled = true;
+        readyBtn.classList.remove("hidden");
+        return;
+      }
+
+      readyBtn.disabled = true;
+      readyBtn.classList.add("hidden");
+    }
+
+    function renderRooms(rooms) {
+      if (!rooms.length) {
+        roomsEl.innerHTML = '<div class="text-slate-400 py-8 text-center">Belum ada room. Jadilah player pertama.</div>';
+        return;
+      }
+
+      roomsEl.innerHTML = rooms.map((item) => `
+        <div class="flex items-center justify-between gap-3 bg-base-200/80 border border-white/10 rounded-lg p-3">
+          <div class="min-w-0">
+            <div class="font-semibold truncate">${escapeHtml(item.name)}</div>
+            <div class="text-sm text-slate-400">${item.playerCount}/${item.maxPlayers} player - ${formatStatus(item.status)} - ${item.readyCount}/2 siap</div>
+          </div>
+          <button class="btn btn-sm btn-primary" ${item.playerCount >= 2 ? "disabled" : ""} data-room="${item.id}">Masuk</button>
+        </div>
+      `).join("");
+
+      roomsEl.querySelectorAll("[data-room]").forEach((button) => {
+        button.addEventListener("click", () => socket.emit("joinRoom", button.dataset.room));
+      });
+    }
+
+    function formatStatus(status) {
+      if (status === "waiting") return "menunggu";
+      if (status === "ready") return "siap mulai";
+      if (status === "pointPause") return "pause poin";
+      if (status === "playing") return "bermain";
+      return status;
+    }
+
+    function drawEmpty() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#0b0f14";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.font = "20px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("Pilih atau buat room untuk bermain", canvas.width / 2, canvas.height / 2);
+    }
+
+    function draw() {
+      requestAnimationFrame(draw);
+      if (!gameState || !displayState) return;
+
+      smoothDisplayState();
+
+      const s = displayState;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#0b0f14";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.strokeStyle = "rgba(255,255,255,0.18)";
+      ctx.setLineDash([10, 12]);
+      ctx.beginPath();
+      ctx.moveTo(canvas.width / 2, 24);
+      ctx.lineTo(canvas.width / 2, canvas.height - 24);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = "#5eead4";
+      ctx.fillRect(24, s.leftY, s.paddleWidth, s.paddleHeight);
+      ctx.fillStyle = "#f87171";
+      ctx.fillRect(canvas.width - 24 - s.paddleWidth, s.rightY, s.paddleWidth, s.paddleHeight);
+      ctx.fillStyle = "#f8fafc";
+      ctx.fillRect(s.ballX, s.ballY, s.ballSize, s.ballSize);
+    }
+
+    function smoothDisplayState() {
+      const amount = room && room.status === "playing" ? 0.35 : 1;
+      displayState.leftY = lerp(displayState.leftY, gameState.leftY, amount);
+      displayState.rightY = lerp(displayState.rightY, gameState.rightY, amount);
+      displayState.ballX = lerp(displayState.ballX, gameState.ballX, amount);
+      displayState.ballY = lerp(displayState.ballY, gameState.ballY, amount);
+      displayState.paddleWidth = gameState.paddleWidth;
+      displayState.paddleHeight = gameState.paddleHeight;
+      displayState.ballSize = gameState.ballSize;
+      displayState.score = gameState.score;
+    }
+
+    function lerp(from, to, amount) {
+      return from + (to - from) * amount;
+    }
+
+    function cloneState(state) {
+      return JSON.parse(JSON.stringify(state));
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;",
+      }[char]));
+    }
+
+    drawEmpty();
+    draw();
+  </script>
+</body>
+</html>
