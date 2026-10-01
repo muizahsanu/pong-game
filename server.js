@@ -7,7 +7,10 @@ const { Server } = require("socket.io");
 const PORT = process.env.PORT || 3000;
 const DB_PATH = path.join(__dirname, "db.json");
 const TICK_RATE = 1000 / 60;
-const SNAPSHOT_RATE = 1000 / 30;
+const PADDLE_SPEED = 420;
+// Toleransi kecepatan paddle dari client (paket bisa datang bergerombol karena jitter).
+const PADDLE_SPEED_TOLERANCE = 1.5;
+const DB_WRITE_DELAY = 500;
 const INITIAL_BALL_SPEED = 240;
 const MAX_BALL_SPEED = 700;
 const BALL_ACCELERATION = 28;
@@ -20,6 +23,9 @@ const io = new Server(server);
 app.use(express.static(path.join(__dirname, "public")));
 
 const rooms = new Map();
+let dbWriteTimer = null;
+let dbWriting = false;
+let dbDirty = false;
 
 function readDb() {
   try {
@@ -29,7 +35,17 @@ function readDb() {
   }
 }
 
+// Tulis db.json secara async + debounce supaya tidak memblok game loop.
 function writeDb() {
+  dbDirty = true;
+  if (dbWriteTimer || dbWriting) return;
+  dbWriteTimer = setTimeout(flushDb, DB_WRITE_DELAY);
+}
+
+async function flushDb() {
+  dbWriteTimer = null;
+  dbDirty = false;
+  dbWriting = true;
   const data = {
     rooms: [...rooms.values()].map((room) => ({
       id: room.id,
@@ -44,7 +60,14 @@ function writeDb() {
     })),
   };
 
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+  try {
+    await fs.promises.writeFile(DB_PATH, JSON.stringify(data, null, 2));
+  } catch (error) {
+    console.error("Gagal menulis db.json:", error);
+  } finally {
+    dbWriting = false;
+    if (dbDirty) writeDb();
+  }
 }
 
 function loadDbRooms() {
@@ -63,11 +86,11 @@ function createRoom(id = makeRoomId(), name, createdAt = new Date().toISOString(
     winner: winner || null,
     createdAt,
     players: new Map(),
-    inputs: new Map(),
+    paddleTargets: new Map(),
     ready: new Set(),
     loop: null,
     lastTick: Date.now(),
-    lastSnapshot: 0,
+    round: 0,
     pendingServeDirection: Math.random() > 0.5 ? 1 : -1,
     state: {
       width: 900,
@@ -129,7 +152,6 @@ function joinRoom(socket, roomId) {
 
   const side = room.players.size === 0 ? "left" : "right";
   room.players.set(socket.id, { id: socket.id, side });
-  room.inputs.set(socket.id, 0);
   room.ready.delete(socket.id);
   socket.data.roomId = room.id;
   socket.data.side = side;
@@ -155,7 +177,7 @@ function leaveCurrentRoom(socket) {
   const room = rooms.get(roomId);
   if (room) {
     room.players.delete(socket.id);
-    room.inputs.delete(socket.id);
+    room.paddleTargets.delete(socket.id);
     room.ready.delete(socket.id);
     socket.leave(roomId);
 
@@ -186,8 +208,30 @@ function broadcastRoomState(room) {
       ready: room.ready.has(player.id),
     })),
     state: room.state,
+    round: room.round,
+    t: Date.now(),
     winner: room.winner,
   });
+}
+
+// Snapshot ringan untuk posisi saja. Volatile: kalau koneksi tersendat,
+// snapshot basi dibuang alih-alih menumpuk lalu datang bergerombol.
+function broadcastSnapshot(room) {
+  const s = room.state;
+  io.to(room.id).volatile.emit("snapshot", [
+    Date.now(),
+    room.round,
+    round1(s.leftY),
+    round1(s.rightY),
+    round1(s.ballX),
+    round1(s.ballY),
+    Math.round(s.ballVX),
+    Math.round(s.ballVY),
+  ]);
+}
+
+function round1(value) {
+  return Math.round(value * 10) / 10;
 }
 
 function startGameLoop(room) {
@@ -205,6 +249,8 @@ function stopGameLoop(room) {
 function resetBall(room, direction) {
   const s = room.state;
   centerPaddles(room);
+  room.round += 1;
+  room.paddleTargets.clear();
   s.ballX = s.width / 2 - s.ballSize / 2;
   s.ballY = s.height / 2 - s.ballSize / 2;
   const angle = (Math.random() * 0.7 - 0.35);
@@ -244,14 +290,6 @@ function markReady(socket) {
   emitRooms();
 }
 
-function maybeBroadcastGameState(room) {
-  const now = Date.now();
-  if (room.status === "playing" && now - room.lastSnapshot < SNAPSHOT_RATE) return;
-
-  room.lastSnapshot = now;
-  broadcastRoomState(room);
-}
-
 function tick(room) {
   if (room.players.size < 2 || room.status !== "playing") return;
 
@@ -260,15 +298,14 @@ function tick(room) {
   room.lastTick = now;
 
   const s = room.state;
-  const paddleSpeed = 420;
+  const maxStep = PADDLE_SPEED * PADDLE_SPEED_TOLERANCE * dt;
 
+  // Posisi paddle dikirim client (prediksi lokal), server hanya membatasi kecepatannya.
   for (const [socketId, player] of room.players) {
-    const input = room.inputs.get(socketId) || 0;
-    if (player.side === "left") {
-      s.leftY = clamp(s.leftY + input * paddleSpeed * dt, 0, s.height - s.paddleHeight);
-    } else {
-      s.rightY = clamp(s.rightY + input * paddleSpeed * dt, 0, s.height - s.paddleHeight);
-    }
+    const key = player.side === "left" ? "leftY" : "rightY";
+    const target = room.paddleTargets.get(socketId);
+    if (target === undefined) continue;
+    s[key] = clamp(moveToward(s[key], target, maxStep), 0, s.height - s.paddleHeight);
   }
 
   accelerateBall(s, dt);
@@ -307,8 +344,17 @@ function tick(room) {
     stopGameLoop(room);
   }
 
-  maybeBroadcastGameState(room);
-  if (room.status === "finished") emitRooms();
+  if (room.status === "playing") {
+    broadcastSnapshot(room);
+  } else {
+    broadcastRoomState(room);
+    if (room.status === "finished") emitRooms();
+  }
+}
+
+function moveToward(value, target, maxStep) {
+  if (Math.abs(target - value) <= maxStep) return target;
+  return value + Math.sign(target - value) * maxStep;
 }
 
 function pauseAfterPoint(room, nextServeDirection) {
@@ -396,10 +442,13 @@ io.on("connection", (socket) => {
     emitRooms();
   });
 
-  socket.on("input", (direction) => {
+  socket.on("paddle", (payload) => {
     const room = rooms.get(socket.data.roomId);
-    if (!room || !room.players.has(socket.id)) return;
-    room.inputs.set(socket.id, clamp(Number(direction) || 0, -1, 1));
+    if (!room || !room.players.has(socket.id) || room.status !== "playing") return;
+    const y = Number(payload && payload.y);
+    // Abaikan posisi dari ronde sebelumnya (sebelum paddle di-reset ke tengah).
+    if (!Number.isFinite(y) || payload.round !== room.round) return;
+    room.paddleTargets.set(socket.id, clamp(y, 0, room.state.height - room.state.paddleHeight));
   });
 
   socket.on("disconnect", () => {

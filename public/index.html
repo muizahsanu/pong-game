@@ -120,10 +120,22 @@
     const readyBtn = document.getElementById("readyBtn");
     const readySummary = document.getElementById("readySummary");
 
+    const PADDLE_SPEED = 420;
+    // Render lawan & bola sedikit di belakang waktu server supaya selalu ada 2 snapshot untuk diinterpolasi.
+    const INTERP_DELAY = 70;
+    const MAX_EXTRAPOLATION = 100;
+    const PADDLE_SEND_INTERVAL = 1000 / 60;
+
     let side = null;
     let room = null;
     let gameState = null;
-    let displayState = null;
+    let snapshots = [];
+    let clockOffset = null;
+    let localY = null;
+    let lastSentY = null;
+    let lastSentAt = 0;
+    let lastFrameAt = performance.now();
+    let touchDirection = 0;
     const keys = new Set();
 
     document.getElementById("startBtn").addEventListener("click", () => {
@@ -147,7 +159,8 @@
       room = null;
       side = null;
       gameState = null;
-      displayState = null;
+      snapshots = [];
+      localY = null;
       lobbyView.classList.remove("hidden");
       gameView.classList.add("hidden");
       roomLabel.textContent = "Lobby";
@@ -166,11 +179,26 @@
     });
 
     socket.on("roomState", (payload) => {
+      const previous = room;
       room = payload;
       gameState = payload.state;
-      if (!displayState || payload.status !== "playing") {
-        displayState = cloneState(gameState);
+      updateClockOffset(payload.t);
+
+      // Status/ronde berubah (mulai, poin, selesai): buang buffer lama dan snap paddle lokal.
+      if (!previous || previous.status !== payload.status || previous.round !== payload.round) {
+        snapshots = [];
+        localY = side ? gameState[side + "Y"] : null;
+        lastSentY = localY;
       }
+      pushSnapshot({
+        t: payload.t,
+        leftY: gameState.leftY,
+        rightY: gameState.rightY,
+        ballX: gameState.ballX,
+        ballY: gameState.ballY,
+        ballVX: gameState.ballVX,
+        ballVY: gameState.ballVY,
+      });
       leftScore.textContent = gameState.score.left;
       rightScore.textContent = gameState.score.right;
       updateReadyButton(payload);
@@ -190,6 +218,20 @@
       }
     });
 
+    socket.on("snapshot", (data) => {
+      if (!room || room.status !== "playing" || data[1] !== room.round) return;
+      updateClockOffset(data[0]);
+      pushSnapshot({
+        t: data[0],
+        leftY: data[2],
+        rightY: data[3],
+        ballX: data[4],
+        ballY: data[5],
+        ballVX: data[6],
+        ballVY: data[7],
+      });
+    });
+
     socket.on("errorMessage", (message) => {
       statusText.textContent = message;
     });
@@ -197,23 +239,29 @@
     window.addEventListener("keydown", (event) => {
       if (["ArrowUp", "ArrowDown", "w", "s", "W", "S"].includes(event.key)) {
         event.preventDefault();
+        if (event.repeat) return;
         keys.add(event.key.toLowerCase());
-        sendInput();
       }
     });
 
     window.addEventListener("keyup", (event) => {
       keys.delete(event.key.toLowerCase());
-      sendInput();
+    });
+
+    window.addEventListener("blur", () => {
+      keys.clear();
+      touchDirection = 0;
     });
 
     function bindHoldButton(id, direction) {
       const button = document.getElementById(id);
       const start = (event) => {
         event.preventDefault();
-        socket.emit("input", direction);
+        touchDirection = direction;
       };
-      const stop = () => socket.emit("input", 0);
+      const stop = () => {
+        if (touchDirection === direction) touchDirection = 0;
+      };
 
       button.addEventListener("pointerdown", start);
       button.addEventListener("pointerup", stop);
@@ -224,11 +272,74 @@
     bindHoldButton("upBtn", -1);
     bindHoldButton("downBtn", 1);
 
-    function sendInput() {
-      let direction = 0;
+    function inputDirection() {
+      let direction = touchDirection;
       if (keys.has("arrowup") || keys.has("w")) direction -= 1;
       if (keys.has("arrowdown") || keys.has("s")) direction += 1;
-      socket.emit("input", direction);
+      return clamp(direction, -1, 1);
+    }
+
+    // Paddle sendiri digerakkan langsung di client (tanpa menunggu server), lalu posisinya dikirim ke server.
+    function updateLocalPaddle(now, dt) {
+      if (!room || room.status !== "playing" || !side || localY === null) return;
+
+      const maxY = gameState.height - gameState.paddleHeight;
+      localY = clamp(localY + inputDirection() * PADDLE_SPEED * dt, 0, maxY);
+
+      if (localY !== lastSentY && now - lastSentAt >= PADDLE_SEND_INTERVAL) {
+        socket.emit("paddle", { y: Math.round(localY * 10) / 10, round: room.round });
+        lastSentY = localY;
+        lastSentAt = now;
+      }
+    }
+
+    // Perkiraan selisih jam server vs client, dihaluskan supaya jitter tidak bikin render loncat.
+    function updateClockOffset(serverTime) {
+      const sample = serverTime - performance.now();
+      clockOffset = clockOffset === null ? sample : clockOffset + (sample - clockOffset) * 0.05;
+    }
+
+    function pushSnapshot(snapshot) {
+      const last = snapshots[snapshots.length - 1];
+      if (last && snapshot.t < last.t) return;
+      snapshots.push(snapshot);
+      if (snapshots.length > 60) snapshots.shift();
+    }
+
+    function interpolatedState(now) {
+      if (!snapshots.length) return gameState;
+
+      const renderTime = now + clockOffset - INTERP_DELAY;
+      let olderIndex = 0;
+      while (olderIndex + 1 < snapshots.length && snapshots[olderIndex + 1].t <= renderTime) {
+        olderIndex += 1;
+      }
+      // Buang snapshot yang sudah lewat.
+      if (olderIndex > 0) snapshots.splice(0, olderIndex);
+
+      const older = snapshots[0];
+      const newer = snapshots[1];
+
+      if (newer && older.t <= renderTime) {
+        const amount = (renderTime - older.t) / (newer.t - older.t || 1);
+        return {
+          leftY: lerp(older.leftY, newer.leftY, amount),
+          rightY: lerp(older.rightY, newer.rightY, amount),
+          ballX: lerp(older.ballX, newer.ballX, amount),
+          ballY: lerp(older.ballY, newer.ballY, amount),
+        };
+      }
+
+      // Snapshot berikutnya belum datang: lanjutkan bola sesuai kecepatannya sebentar.
+      const ahead = room && room.status === "playing"
+        ? clamp(renderTime - older.t, 0, MAX_EXTRAPOLATION) / 1000
+        : 0;
+      return {
+        leftY: older.leftY,
+        rightY: older.rightY,
+        ballX: older.ballX + older.ballVX * ahead,
+        ballY: clamp(older.ballY + older.ballVY * ahead, 0, gameState.height - gameState.ballSize),
+      };
     }
 
     function updateReadyButton(payload) {
@@ -300,13 +411,22 @@
       ctx.fillText("Pilih atau buat room untuk bermain", canvas.width / 2, canvas.height / 2);
     }
 
-    function draw() {
+    function draw(now = performance.now()) {
       requestAnimationFrame(draw);
-      if (!gameState || !displayState) return;
+      const dt = Math.min((now - lastFrameAt) / 1000, 0.05);
+      lastFrameAt = now;
+      if (!gameState) return;
 
-      smoothDisplayState();
+      updateLocalPaddle(now, dt);
 
-      const s = displayState;
+      const s = {
+        ...interpolatedState(now),
+        paddleWidth: gameState.paddleWidth,
+        paddleHeight: gameState.paddleHeight,
+        ballSize: gameState.ballSize,
+      };
+      if (localY !== null && room.status === "playing") s[side + "Y"] = localY;
+
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = "#0b0f14";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -327,24 +447,12 @@
       ctx.fillRect(s.ballX, s.ballY, s.ballSize, s.ballSize);
     }
 
-    function smoothDisplayState() {
-      const amount = room && room.status === "playing" ? 0.35 : 1;
-      displayState.leftY = lerp(displayState.leftY, gameState.leftY, amount);
-      displayState.rightY = lerp(displayState.rightY, gameState.rightY, amount);
-      displayState.ballX = lerp(displayState.ballX, gameState.ballX, amount);
-      displayState.ballY = lerp(displayState.ballY, gameState.ballY, amount);
-      displayState.paddleWidth = gameState.paddleWidth;
-      displayState.paddleHeight = gameState.paddleHeight;
-      displayState.ballSize = gameState.ballSize;
-      displayState.score = gameState.score;
-    }
-
     function lerp(from, to, amount) {
       return from + (to - from) * amount;
     }
 
-    function cloneState(state) {
-      return JSON.parse(JSON.stringify(state));
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
     }
 
     function escapeHtml(value) {
@@ -358,7 +466,7 @@
     }
 
     drawEmpty();
-    draw();
+    requestAnimationFrame(draw);
   </script>
 </body>
 </html>
